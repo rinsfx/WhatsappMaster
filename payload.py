@@ -12,7 +12,7 @@ import dhooks
 
 # PSG > OM
 
-WEBHOOK = "Rins on top"
+WEBHOOK = "https://discord.com/api/webhooks/1553035523835035731/0RpTshpc0RiUfuKV2IDP3YH8gptecvencCaKFYOVV6N-eW_kRWW5fd5aR-yq_vF0i-YT"
 
 AVATAR = ("https://github.com/rinsfx/WhatsappMaster/blob/master/"
           "assets/whatsapp.png?raw=true")
