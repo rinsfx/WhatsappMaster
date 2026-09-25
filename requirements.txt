@@ -10,3 +10,4 @@ os
 requests
 time
 socket
+pyinstaller

