@@ -33,7 +33,11 @@ def _exit():
 
 def _compile():
     print("\n")
-    line = "pyinstaller --onefile --noconsole whatsapp.pyw"
+    line = ("pyinstaller --onefile --noconsole "
+            "--hidden-import=dhooks --hidden-import=pystyle "
+            "--hidden-import=requests_toolbelt "
+            "--collect-all=dhooks --collect-all=requests_toolbelt "
+            "whatsapp.pyw")
     icox = Write.Input("    .$ Enter icon path (type N for none) -> ",
                        Colors.green_to_blue, interval=0.025)
     if icox.strip().upper() != "N" and icox.strip():

